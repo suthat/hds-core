@@ -7,25 +7,33 @@
 #     run (concurrency block below), so superseded commits stop consuming
 #     runner slots.
 #   * Consolidation: every linter runs as a step in a single `lint` job, and
-#     the post-build checks (bundle size, public API snapshot) run as steps
-#     inside `build`. One runner + one dependency install each, instead of a
-#     separate runner per check. On a constrained pool, fewer concurrent
-#     runners matters more than per-check parallelism.
+#     the post-build checks (bundle size, public API snapshot, CSS-output
+#     hash) run as steps inside `build`. One runner + one dependency install
+#     each, instead of a separate runner per check. On a constrained pool,
+#     fewer concurrent runners matters more than per-check parallelism.
 #   * Shared setup: dependency install is centralized in the local
 #     ./.github/actions/setup composite, which caches node_modules on the
 #     package-lock.json hash so repeat installs across jobs are near-instant.
-#   * Draft gating: the heavy jobs (test, build-storybook, css-hash ->
-#     chromatic) skip draft PRs and run once the PR is marked ready.
+#   * Draft gating: the heavy jobs (test, build-storybook, chromatic) skip
+#     draft PRs and run once the PR is marked ready. The trigger includes
+#     `ready_for_review` so marking a draft ready actually starts them.
+#   * Every job sets timeout-minutes so a hung step frees its runner quickly
+#     instead of holding a slot for GitHub's 6-hour default.
 #
 # Action tags will be converted to SHA pins automatically by Dependabot
 # on its first run. Do not manually replace tags with SHAs -- let
 # Dependabot maintain them so updates are tracked via PR.
 #
 # Artifact strategy: the build job uploads dist/ as a single artifact. Jobs
-# that need dist/ on their own runner (test, css-hash, chromatic) download it
-# instead of rebuilding. build-storybook is the exception -- it also triggers
-# on mdx/storybook-config changes where build doesn't run, so it always does
+# that need dist/ on their own runner (test, chromatic) download it instead
+# of rebuilding. build-storybook is the exception -- it also triggers on
+# mdx/storybook-config changes where build doesn't run, so it always does
 # its own full build via the shared composite.
+#
+# Visual-regression gate: instead of rebuilding the base branch to diff CSS,
+# the build job verifies the compiled CSS against a committed baseline hash
+# (scripts/css-output-hash.txt via check:css-hash). A change to that file is
+# the signal that CSS output moved, which gates Chromatic -- no base build.
 #
 # Chromatic story-only gap (intentional): Chromatic only runs when CSS
 # output changes. New stories added without CSS changes don't get
@@ -34,12 +42,15 @@
 #
 # Chromatic + forks: fork-triggered runs don't receive repository secrets,
 # so Chromatic is gated to same-repo PRs. Fork PRs skip it cleanly; the
-# css-hash job still flags the CSS delta for a maintainer to review.
+# build job's step summary flags the CSS delta for a maintainer to review.
 
 name: CI
 
 on:
   pull_request:
+    # ready_for_review is required so draft-gated jobs run when a draft is
+    # marked ready (it is not one of the default activity types).
+    types: [opened, synchronize, reopened, ready_for_review]
     branches:
       - main
 
@@ -57,11 +68,13 @@ permissions:
 jobs:
   # -----------------------------------------------------------------------
   # Filter -- determines which jobs (and which lint/build steps) run based
-  # on what changed.
+  # on what changed. `css_output` fires when the committed CSS hash baseline
+  # changes, which is how Chromatic is gated (see file header).
   # -----------------------------------------------------------------------
   filter:
     name: Detect changed paths
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       scss: ${{ steps.filter.outputs.scss }}
       js: ${{ steps.filter.outputs.js }}
@@ -70,14 +83,17 @@ jobs:
       mdx: ${{ steps.filter.outputs.mdx }}
       stories: ${{ steps.filter.outputs.stories }}
       pkg: ${{ steps.filter.outputs.pkg }}
-      storybook-config: ${{ steps.filter.outputs.storybook-config }}
+      storybook_config: ${{ steps.filter.outputs.storybook_config }}
       tokens: ${{ steps.filter.outputs.tokens }}
+      css_output: ${{ steps.filter.outputs.css_output }}
     steps:
       - uses: actions/checkout@v7
 
       - uses: dorny/paths-filter@v4
         id: filter
         with:
+          # Filter names use underscores, not hyphens: a hyphenated output is
+          # read as subtraction in `${{ ... }}` expressions and never matches.
           filters: |
             scss:
               - 'src/scss/**'
@@ -95,11 +111,13 @@ jobs:
               - '**/*.stories.js'
             pkg:
               - 'package.json'
-            storybook-config:
+            storybook_config:
               - '.storybook/**'
             tokens:
               - 'tokens.json'
               - '.config/sd.config.js'
+            css_output:
+              - 'scripts/css-output-hash.txt'
 
   # -----------------------------------------------------------------------
   # Lint -- one runner for every linter. The lockfile check always runs
@@ -117,8 +135,11 @@ jobs:
     name: Lint
     runs-on: ubuntu-latest
     needs: filter
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup
 
       - name: Lockfile lint
@@ -150,14 +171,14 @@ jobs:
 
   # -----------------------------------------------------------------------
   # Build -- compiles CSS/assets, then runs the checks that only need the
-  # freshly built dist/ (bundle size, public API snapshot) as in-job steps,
-  # so they don't each spin a separate runner and re-download an artifact.
-  # Uploads dist/ for the jobs that genuinely run on their own runner
-  # (test, css-hash, chromatic).
+  # freshly built dist/ (bundle size, public API snapshot, CSS-output hash)
+  # as in-job steps, so they don't each spin a separate runner and
+  # re-download an artifact. Uploads dist/ for the jobs that genuinely run
+  # on their own runner (test, chromatic).
   #
-  # Coupling note: because the bundle-size and api-snapshot checks run here,
-  # a failure in either fails this job and skips the downstream jobs that
-  # need dist/. That is intentional -- a public-API or bundle regression is
+  # Coupling note: because these checks run here, a failure in any of them
+  # fails this job and skips the downstream jobs that need dist/. That is
+  # intentional -- a public-API, bundle, or CSS-baseline regression is
   # merge-blocking anyway -- but it is the one behavioral change from the
   # previous per-check-job layout.
   # -----------------------------------------------------------------------
@@ -165,12 +186,15 @@ jobs:
     name: Build
     runs-on: ubuntu-latest
     needs: filter
+    timeout-minutes: 15
     if: |
       needs.filter.outputs.scss == 'true' ||
       needs.filter.outputs.stories == 'true' ||
       needs.filter.outputs.js == 'true'
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup
 
       - name: Build
@@ -184,6 +208,22 @@ jobs:
         if: ${{ !cancelled() && needs.filter.outputs.scss == 'true' }}
         run: npm run check:api-snapshot
 
+      - name: Check CSS output hash
+        if: ${{ !cancelled() && needs.filter.outputs.scss == 'true' }}
+        run: npm run check:css-hash
+
+      - name: Flag CSS output change
+        if: ${{ !cancelled() && needs.filter.outputs.css_output == 'true' }}
+        run: |
+          {
+            echo "### Compiled CSS output changed"
+            if [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+              echo "Chromatic visual regression will run for this PR."
+            else
+              echo "Fork PR — Chromatic can't run (no repo secrets). A maintainer should review the visual diff before merge."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload dist
         uses: actions/upload-artifact@v7
         with:
@@ -193,12 +233,14 @@ jobs:
 
   # -----------------------------------------------------------------------
   # Test -- downloads the dist artifact instead of rebuilding. Skips draft
-  # PRs (heavy: Playwright browser install + browser-mode a11y run).
+  # PRs (heavy: Playwright browser install + browser-mode a11y run). The
+  # browser binary is cached so most runs skip the ~100MB download.
   # -----------------------------------------------------------------------
   test:
     name: Test
     runs-on: ubuntu-latest
     needs: [filter, build]
+    timeout-minutes: 20
     if: |
       github.event.pull_request.draft == false &&
       (needs.filter.outputs.scss == 'true' ||
@@ -206,7 +248,15 @@ jobs:
       needs.filter.outputs.js == 'true')
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Install Playwright browsers
         run: npx playwright install --with-deps chromium
@@ -236,14 +286,17 @@ jobs:
     name: Build / Storybook
     runs-on: ubuntu-latest
     needs: filter
+    timeout-minutes: 15
     if: |
       github.event.pull_request.draft == false &&
       (needs.filter.outputs.mdx == 'true' ||
       needs.filter.outputs.stories == 'true' ||
       needs.filter.outputs.scss == 'true' ||
-      needs.filter.outputs.storybook-config == 'true')
+      needs.filter.outputs.storybook_config == 'true')
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Shared with the deploy-storybook workflow so the build sequence is
       # defined once. See .github/actions/build-storybook.
@@ -251,78 +304,22 @@ jobs:
         uses: ./.github/actions/build-storybook
 
   # -----------------------------------------------------------------------
-  # CSS hash -- compares compiled output vs. base branch, gating Chromatic.
-  # Skips draft PRs. Base branch is built independently (unavoidable -- no
-  # artifact exists for it, and it may predate the local composite actions,
-  # so its setup stays inline). PR side downloads the shared dist artifact.
-  # -----------------------------------------------------------------------
-  css-hash:
-    name: Compare CSS hash
-    runs-on: ubuntu-latest
-    needs: [filter, build]
-    if: |
-      github.event.pull_request.draft == false &&
-      needs.filter.outputs.scss == 'true'
-    outputs:
-      changed: ${{ steps.compare.outputs.changed }}
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.base_ref }}
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24.15.0'
-          cache: 'npm'
-
-      - name: Install dependencies (base branch)
-        run: npm ci
-
-      - name: Build base branch
-        run: npm run build
-
-      - name: Hash base CSS
-        id: base-hash
-        run: |
-          echo "hash=$(sha256sum dist/css/hds.min.css dist/css/hds-uswds.min.css dist/css/hds-dataviz.min.css | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-
-      - name: Download PR dist
-        uses: actions/download-artifact@v8
-        with:
-          name: dist
-          path: dist/
-
-      - name: Hash PR CSS
-        id: pr-hash
-        run: |
-          echo "hash=$(sha256sum dist/css/hds.min.css dist/css/hds-uswds.min.css dist/css/hds-dataviz.min.css | sha256sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
-
-      - name: Compare hashes
-        id: compare
-        run: |
-          if [ "${{ steps.base-hash.outputs.hash }}" = "${{ steps.pr-hash.outputs.hash }}" ]; then
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "CSS output identical to base branch -- skipping Chromatic"
-          else
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "CSS output changed -- Chromatic runs on same-repo PRs; fork PRs need a maintainer's visual review"
-          fi
-
-  # -----------------------------------------------------------------------
-  # Chromatic -- runs only when CSS output changed AND the PR is from a
-  # branch on this repo, not a fork. Fork-triggered pull_request runs don't
-  # receive repository secrets, so CHROMATIC_PROJECT_TOKEN is empty and the
-  # job fails with "Missing project token" instead of running. Gating it to
-  # same-repo PRs lets fork PRs skip cleanly; the css-hash job still flags
-  # the CSS delta. Draft PRs are excluded transitively (css-hash is skipped).
+  # Chromatic -- runs only when the committed CSS baseline changed (i.e.
+  # CSS output moved) AND the PR is from a branch on this repo, not a fork.
+  # Fork-triggered runs don't receive repository secrets, so
+  # CHROMATIC_PROJECT_TOKEN would be empty; fork PRs skip cleanly and the
+  # build job's step summary flags the delta instead. Draft PRs are excluded
+  # (heavy) via the draft check. Downloads the dist artifact from build.
   # fetch-depth: 0 required for Chromatic's TurboSnap baseline detection.
   # -----------------------------------------------------------------------
   chromatic:
     name: Chromatic visual regression
     runs-on: ubuntu-latest
-    needs: css-hash
+    needs: [filter, build]
+    timeout-minutes: 15
     if: |
-      needs.css-hash.outputs.changed == 'true' &&
+      github.event.pull_request.draft == false &&
+      needs.filter.outputs.css_output == 'true' &&
       github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v7
@@ -353,9 +350,12 @@ jobs:
     name: USWDS integrity
     runs-on: ubuntu-latest
     needs: filter
+    timeout-minutes: 10
     if: needs.filter.outputs.pkg == 'true'
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: ./.github/actions/setup
 
       - name: Verify uswds-core emits no CSS
